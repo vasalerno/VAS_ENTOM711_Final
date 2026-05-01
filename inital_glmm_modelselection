@@ -1,0 +1,174 @@
+install.packages("")
+library(lme4)
+library(DHARMa)
+library(broom.mixed)
+library(ggplot2)
+library(car)
+source(file = "bbolker.github.io")
+
+## ----- FINDING THE RIGHT MODEL (W/ NOTES ABOUT THE PROCESS) -----  ##
+
+#GLMM where we have a random intercept for bee_id so that activity can vary by each individual bee (biologically relevant)
+ocam_glmer <- glmer(activity ~ outer_temp_mean + unit + (1|bee_id), data = ios_temp, family = "poisson" )
+summary(ocam_glmer)
+
+#checking to see if that data is overdispersed (this divides the Pearson residuals by the residuals degrees of freedom)
+
+#This code comes (open-source) from Bolker et al. 2011 (https://github.com/bbolker/mixedmodels-misc/blob/531c55f12a0209d15c924d0cb5259f838538a184/glmmFAQ.rmd)
+```{r overdisp_fun}
+overdisp_fun <- function(model) {
+  rdf <- df.residual(model)
+  rp <- residuals(model,type="pearson")
+  Pearson.chisq <- sum(rp^2)
+  prat <- Pearson.chisq/rdf
+  pval <- pchisq(Pearson.chisq, df=rdf, lower.tail=FALSE)
+  c(chisq=Pearson.chisq,ratio=prat,rdf=rdf,p=pval)
+}
+```
+
+overdisp_fun(ocam_glmer)
+#The ratio is 7.336405 which is greater than 1 - this indicates that we have observed variance - this means that the Poisson distribution is not the right fit. This fits my thoughts that variance is not equal to the mean.
+# Time to move on to to a Negative Binomial. 
+
+#Negative Binomial. - GLMM
+ocam_glmm_nb <- glmer.nb(activity ~ outer_temp_mean + unit + (1|bee_id), data = ios_temp)
+summary(ocam_glmm_nb)
+
+overdisp_fun(ocam_glmm_nb)
+#The ratio is closer to 1 at 1.3067 but the p-value is beloq 0.05 so I am going to try a different options
+
+
+#Poisson -log normal
+ios_temp$X <- 1:nrow(ios_temp) #create a new variable called x
+ocam_glmm_pln <- glmer(activity ~ outer_temp_mean + unit + (1|bee_id) + (1|X), data = ios_temp, family = "poisson" )
+summary(ocam_glmm_pln)
+#check overdispersion
+overdisp_fun(ocam_glmm_pln)
+#The ratio is now under 1 (0.158)!
+
+#Plotting Model Parameters
+tidy_mod <- broom.mixed::tidy(ocam_glmem_pln, effects = "fixed")
+
+ggplot(tidy_mod, aes(x = term, y = estimate)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error), width = 0.2) +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "GLMM Fixed Effects Coefficients", y = "Estimate", x = "")
+#This plot tells me that the unit (megachilidae) and outer_temp_mean have a strong effect as predictors. This makes sense to me because osmia3 and osmia4 are actually on the same property, whereas megachilidae is in a different climactic region of CA
+
+#The issue here though, is that this may not represent the actual biology of the organisms because from my understanding, using the Poisson Log Normal version here basically allows every point to have its own variance, so it kind of justifies any deviation from trend/pattern. This is too "perfect" per se.
+
+#So I am moving back to Negative Binomial GLMM with some updates
+
+
+ocam_glmm_nb2 <- glmer.nb(activity ~ outer_temp_mean + unit + (1|bee_id), data = ios_temp)
+summary(ocam_glmm_nb2)
+
+#simulating 1000 residuals against predictd values to see if there is a pattern to it 
+simulated_nb2 <- simulateResiduals(ocam_glmm_nb2, n =1000)
+plot(simulated_nb2)
+testDispersion(simulated_nb2)
+testZeroInflation(simulated_nb2)
+
+#The results of this attempt show me that variance is underestimated here greatly, and reminds me that I do have true zero values in my data (bee inactivity happens and I may be underestimating the efficiency of bees to build/support nesting) --> this tells me I need a zero inflated attempt now
+library(glmmTMB) #this package will allow me to set zero inflated nb within the glmm
+
+ocam_glmm_nbZ <- glmmTMB(activity ~ outer_temp_mean + unit + (1|bee_id), ziformula = ~ 1, family = nbinom2, data = ios_temp)
+summary(ocam_glmm_nbZ)
+
+simulated_nbZ <- simulateResiduals(ocam_glmm_nbZ, n =1000)
+plot(simulated_nbZ)
+testDispersion(simulated_nbZ)
+testZeroInflation(simulated_nbZ)
+
+#So the Zero inflated NB did not get better than the second attempt at NB (one above), this is still telling me that there is likely not a linear relationship between temperature and activity at all. Through my research it seems a spline focused attempt is the next step
+
+library(splines)
+ocam_glmm_spline <-glmer.nb(activity ~ ns(outer_temp_mean, df =3) + unit + (1|bee_id), data = ios_temp)
+summary(ocam_glmm_spline)
+
+simulated_spline <- simulateResiduals(ocam_glmm_spline, n =1000)
+plot(simulated_spline)
+testDispersion(simulated_spline)
+testZeroInflation(simulated_spline)
+
+#ok so the spline attempt did not get me that much closer :(
+
+ocam_glmm_quadnb <- glmer.nb(
+  activity ~ poly(outer_temp_mean, 2, raw = TRUE) + unit + (1 | bee_id),
+  data = ios_temp
+  )
+summary(ocam_glmm_quadnb)
+
+simulated_quadnb<- simulateResiduals(ocam_glmm_quadnb, n =1000)
+plot(simulated_quadnb)
+testDispersion(simulated_quadnb)
+testZeroInflation(simulated_quadnb)
+
+#Ok so that also did not significantly improve
+
+#lets see if individuals themselves (each bee) responds differently at temperatures using a random slope approach:
+ocam_rs <- glmer.nb(
+  activity ~ outer_temp_mean + unit + (outer_temp_mean | bee_id),
+  data = ios_temp,
+  control = glmerControl(optimizer = "bobyqa")
+)
+
+
+simulated_rs <- simulateResiduals(ocam_rs, n =1000)
+plot(simulated_rs)
+testDispersion(simulated_rs)
+testZeroInflation(simulated_rs)
+
+#so visually to me there is not a great fit for this data, but let's actually compare them using AIC
+library(data.table) 
+AIC(
+  ocam_glmm_nb,
+  ocam_glmm_nbZ,
+  ocam_glmm_spline,
+  ocam_glmm_quadnb,
+  ocam_rs
+)
+
+#Create an (empty) AIC table with the model headers of interest:
+AIC_table_Initial <- data.table(
+  Model = c("Negative Binomial",
+            "NB Zero Inflated",
+            "NB Spline",
+            "NB QuadTemps",
+            "NB Random Slopes"),
+  AIC_value = c(
+    AIC(ocam_glmm_nb),
+    AIC(ocam_glmm_nbZ),
+    AIC(ocam_glmm_spline),
+    AIC(ocam_glmm_quadnb),
+    AIC(ocam_rs)
+  )
+)
+# Calculate the Delta AIC valuees for the table and populate them in the table (Best AIC value - candidate AIC)
+AIC_table_Initial[, Delta_AIC := AIC_value - min(AIC_value)]
+
+AIC_table_Initial
+
+#So the Spline NB is the only one with an AIC value under 2! 
+library(ggeffects)
+
+spline_predicted <- ggpredict(ocam_glmm_spline, terms = c("outer_temp_mean [all]", "unit"))
+plot(spline_predicted)
+
+#While the AIC showed that the spline NB was the only one under 2 and the rest of the models were over 10, this is a comparison of the closest AIC value model
+anova(ocam_glmm_spline,ocam_rs)
+
+#My model selection process suggests that the Spline version is the best, so I am going to go through the other assumption checking I should do:
+
+#Since I care about individual bee_id (as that is a key behavior), I want to check random intercepts for them:
+ri_bees <- unlist(ranef(ocam_glmm_spline)$bee_id[1])
+qqnorm(ri_bees)
+qqline(ri_bees)
+plot(ri_bees)
+
+#one thing about my data is that outer_temp_mean and unit are likely or could be highly correlated (given that unit in a sense is location)
+vif(lm(activity ~ outer_temp_mean + unit, data = ios_temp))
+
+#The values for this is 5, which is indicate of co-linearity :(
